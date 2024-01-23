@@ -27,6 +27,7 @@
 
 #include "bytestream.h"
 #include "codec_internal.h"
+#include "dxv.h"
 #include "encode.h"
 #include "texturedsp.h"
 
@@ -39,10 +40,6 @@
  */
 #define LOOKBACK_HT_ELEMS 0x40000
 #define LOOKBACK_WORDS    0x20202
-
-enum DXVTextureFormat {
-    DXV_FMT_DXT1 = MKBETAG('D', 'X', 'T', '1'),
-};
 
 typedef struct HTEntry {
     uint32_t key;
@@ -110,44 +107,15 @@ static void ht_delete(HTEntry *ht, AVCRC *hash_ctx,
 typedef struct DXVEncContext {
     AVClass *class;
 
-    TextureDSPContext texdsp;
+    DXVContext base;
+
     PutByteContext pbc;
-
-    uint8_t *tex_data;   // Compressed texture
-    int64_t tex_size;    // Texture size
-
-    /* Optimal number of slices for parallel decoding */
-    int slice_count;
-
-    TextureDSPThreadContext enc;
-
-    enum DXVTextureFormat tex_fmt;
-    int (*compress_tex)(AVCodecContext *avctx);
 
     AVCRC *crc_ctx;
 
     HTEntry color_lookback_ht[LOOKBACK_HT_ELEMS];
     HTEntry lut_lookback_ht[LOOKBACK_HT_ELEMS];
 } DXVEncContext;
-
-static int compress_texture_thread(AVCodecContext *avctx, void *arg,
-                                   int slice, int thread_nb)
-{
-    DXVEncContext *ctx = avctx->priv_data;
-    AVFrame *frame = arg;
-
-    if (ctx->enc.tex_funct) {
-        ctx->enc.tex_data.out = ctx->tex_data;
-        ctx->enc.frame_data.in = frame->data[0];
-        ctx->enc.stride = frame->linesize[0];
-        return ff_texturedsp_compress_thread(avctx, &ctx->enc, slice, thread_nb);
-    } else {
-        /* unimplemented: YCoCg formats */
-        return AVERROR_INVALIDDATA;
-    }
-
-    return 0;
-}
 
 /* Converts an index offset value to a 2-bit opcode and pushes it to a stream.
  * Inverse of CHECKPOINT in dxv.c.  */
@@ -186,27 +154,27 @@ static int dxv_compress_dxt1(AVCodecContext *avctx)
     ht_init(ctx->color_lookback_ht);
     ht_init(ctx->lut_lookback_ht);
 
-    bytestream2_put_le32(pbc, AV_RL32(ctx->tex_data));
-    bytestream2_put_le32(pbc, AV_RL32(ctx->tex_data + 4));
+    bytestream2_put_le32(pbc, AV_RL32(ctx->base.tex_data));
+    bytestream2_put_le32(pbc, AV_RL32(ctx->base.tex_data + 4));
 
-    ht_lookup_and_upsert(ctx->color_lookback_ht, ctx->crc_ctx, AV_RL32(ctx->tex_data), 0);
-    ht_lookup_and_upsert(ctx->lut_lookback_ht, ctx->crc_ctx, AV_RL32(ctx->tex_data + 4), 1);
+    ht_lookup_and_upsert(ctx->color_lookback_ht, ctx->crc_ctx, AV_RL32(ctx->base.tex_data), 0);
+    ht_lookup_and_upsert(ctx->lut_lookback_ht, ctx->crc_ctx, AV_RL32(ctx->base.tex_data + 4), 1);
 
-    while (pos + 2 <= ctx->tex_size / 4) {
+    while (pos + 2 <= ctx->base.tex_size / 4) {
         idx = 0;
 
-        color = AV_RL32(ctx->tex_data + pos * 4);
+        color = AV_RL32(ctx->base.tex_data + pos * 4);
         prev_pos = ht_lookup_and_upsert(ctx->color_lookback_ht, ctx->crc_ctx, color, pos);
         color_idx = prev_pos != -1 ? pos - prev_pos : 0;
         if (pos >= LOOKBACK_WORDS) {
             uint32_t old_pos = pos - LOOKBACK_WORDS;
-            uint32_t old_color = AV_RL32(ctx->tex_data + old_pos * 4);
+            uint32_t old_color = AV_RL32(ctx->base.tex_data + old_pos * 4);
             ht_delete(ctx->color_lookback_ht, ctx->crc_ctx, old_color, old_pos);
         }
         pos++;
 
-        lut = AV_RL32(ctx->tex_data + pos * 4);
-        if (color_idx && lut == AV_RL32(ctx->tex_data + (pos - color_idx) * 4)) {
+        lut = AV_RL32(ctx->base.tex_data + pos * 4);
+        if (color_idx && lut == AV_RL32(ctx->base.tex_data + (pos - color_idx) * 4)) {
             idx = color_idx;
         } else {
             idx = 0;
@@ -215,7 +183,7 @@ static int dxv_compress_dxt1(AVCodecContext *avctx)
         }
         if (pos >= LOOKBACK_WORDS) {
             uint32_t old_pos = pos - LOOKBACK_WORDS;
-            uint32_t old_lut = AV_RL32(ctx->tex_data + old_pos * 4);
+            uint32_t old_lut = AV_RL32(ctx->base.tex_data + old_pos * 4);
             ht_delete(ctx->lut_lookback_ht, ctx->crc_ctx, old_lut, old_pos);
         }
         pos++;
@@ -248,15 +216,17 @@ static int dxv_encode(AVCodecContext *avctx, AVPacket *pkt,
     /* unimplemented: needs to depend on compression ratio of tex format */
     /* under DXT1, we need 3 words to encode load ops for 32 words.
      * the first 2 words of the texture do not need load ops. */
-    ret = ff_alloc_packet(avctx, pkt, DXV_HEADER_LENGTH + ctx->tex_size + AV_CEIL_RSHIFT(ctx->tex_size - 8, 7) * 12);
+    ret = ff_alloc_packet(avctx, pkt, DXV_HEADER_LENGTH + ctx->base.tex_size + AV_CEIL_RSHIFT(ctx->base.tex_size - 8, 7) * 12);
     if (ret < 0)
         return ret;
 
-    avctx->execute2(avctx, compress_texture_thread, (void*)frame, NULL, ctx->enc.slice_count);
+    ret = ff_dxv_compress_inner_tex(avctx, &ctx->base, frame);
+    if (ret < 0)
+        return ret;
 
     bytestream2_init_writer(pbc, pkt->data, pkt->size);
 
-    bytestream2_put_le32(pbc, ctx->tex_fmt);
+    bytestream2_put_le32(pbc, ctx->base.tex_fmt);
     bytestream2_put_byte(pbc, 4);
     bytestream2_put_byte(pbc, 0);
     bytestream2_put_byte(pbc, 0);
@@ -264,7 +234,7 @@ static int dxv_encode(AVCodecContext *avctx, AVPacket *pkt,
     /* Fill in compressed size later */
     bytestream2_skip_p(pbc, 4);
 
-    ret = ctx->compress_tex(avctx);
+    ret = ctx->base.process_outer_tex(avctx);
     if (ret < 0)
         return ret;
 
@@ -286,28 +256,16 @@ static av_cold int dxv_init(AVCodecContext *avctx)
         return ret;
     }
 
-    ff_texturedspenc_init(&ctx->texdsp);
+    avctx->coded_height = FFALIGN(avctx->height, 16);
+    avctx->coded_width  = FFALIGN(avctx->width,  16);
+    
+    ff_texturedspenc_init(&ctx->base.texdsp);
 
-    switch (ctx->tex_fmt) {
-    case DXV_FMT_DXT1:
-        ctx->compress_tex = dxv_compress_dxt1;
-        ctx->enc.tex_funct = ctx->texdsp.dxt1_block;
-        ctx->enc.tex_ratio = 8;
-        break;
-    default:
-        av_log(avctx, AV_LOG_ERROR, "Invalid format %08X\n", ctx->tex_fmt);
-        return AVERROR_INVALIDDATA;
-    }
-    ctx->enc.raw_ratio = 16;
-    ctx->tex_size = FFALIGN(avctx->width, 16) / TEXTURE_BLOCK_W *
-                    FFALIGN(avctx->height, 16) / TEXTURE_BLOCK_H *
-                    ctx->enc.tex_ratio;
-    ctx->enc.slice_count = av_clip(avctx->thread_count, 1, FFALIGN(avctx->height, 16) / TEXTURE_BLOCK_H);
+    ctx->base.process_outer_tex = dxv_compress_dxt1;
 
-    ctx->tex_data = av_malloc(ctx->tex_size);
-    if (!ctx->tex_data) {
-        return AVERROR(ENOMEM);
-    }
+    ret = ff_dxv_prepare_ctx(avctx, &ctx->base);
+    if (ret < 0)
+        return ret;
 
     ctx->crc_ctx = (AVCRC*)av_crc_get_table(AV_CRC_32_IEEE);
     if (!ctx->crc_ctx) {
@@ -322,15 +280,15 @@ static av_cold int dxv_close(AVCodecContext *avctx)
 {
     DXVEncContext *ctx = avctx->priv_data;
 
-    av_freep(&ctx->tex_data);
+    ff_dxv_free_ctx(&ctx->base);
 
     return 0;
 }
 
-#define OFFSET(x) offsetof(DXVEncContext, x)
-#define FLAGS     AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
+#define OFFSET(x)     offsetof(DXVEncContext, x)
+#define FLAGS         AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_ENCODING_PARAM
 static const AVOption options[] = {
-    { "format", NULL, OFFSET(tex_fmt), AV_OPT_TYPE_INT, { .i64 = DXV_FMT_DXT1 }, DXV_FMT_DXT1, DXV_FMT_DXT1, FLAGS, "format" },
+    { "format", NULL, OFFSET(base.tex_fmt), AV_OPT_TYPE_INT, { .i64 = DXV_FMT_DXT1 }, DXV_FMT_DXT1, DXV_FMT_DXT1, FLAGS, "format" },
         { "dxt1", "DXT1 (Normal Quality, No Alpha)", 0, AV_OPT_TYPE_CONST, { .i64 = DXV_FMT_DXT1   }, 0, 0, FLAGS, "format" },
     { NULL },
 };
